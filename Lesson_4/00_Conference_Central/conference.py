@@ -20,11 +20,20 @@ from protorpc import messages
 from protorpc import message_types
 from protorpc import remote
 
+from google.appengine.api import memcache
+from google.appengine.api import taskqueue
 from google.appengine.ext import ndb
 
+from models import ConflictException
 from models import Profile
 from models import ProfileMiniForm
 from models import ProfileForm
+from models import BooleanMessage
+from models import Conference
+from models import ConferenceForm
+from models import ConferenceForms
+from models import ConferenceQueryForm
+from models import ConferenceQueryForms
 from models import TeeShirtSize
 
 from utils import getUserId
@@ -33,14 +42,9 @@ from settings import WEB_CLIENT_ID
 
 EMAIL_SCOPE = endpoints.EMAIL_SCOPE
 API_EXPLORER_CLIENT_ID = endpoints.API_EXPLORER_CLIENT_ID
+MEMCACHE_ANNOUNCEMENTS_KEY = "RECENT_ANNOUNCEMENTS"
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-from models import Conference
-from models import ConferenceForm
-
-from models import ConferenceForms
-from models import ConferenceQueryForm
-from models import ConferenceQueryForms
 
 DEFAULTS = {
     "city": "Default City",
@@ -49,6 +53,33 @@ DEFAULTS = {
     "topics": [ "Default", "Topic" ],
 }
 
+OPERATORS = {
+            'EQ':   '=',
+            'GT':   '>',
+            'GTEQ': '>=',
+            'LT':   '<',
+            'LTEQ': '<=',
+            'NE':   '!='
+            }
+
+FIELDS =    {
+            'CITY': 'city',
+            'TOPIC': 'topics',
+            'MONTH': 'month',
+            'MAX_ATTENDEES': 'maxAttendees',
+            }
+
+CONF_GET_REQUEST = endpoints.ResourceContainer(
+    message_types.VoidMessage,
+    websafeConferenceKey=messages.StringField(1),
+)
+
+CONF_POST_REQUEST = endpoints.ResourceContainer(
+    ConferenceForm,
+    websafeConferenceKey=messages.StringField(1),
+)
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 
 @endpoints.api( name='conference',
@@ -142,16 +173,23 @@ class ConferenceApi(remote.Service):
             name='queryConferences')
     def queryConferences(self, request):
         """Query for conferences."""
-        conferences = Conference._getQuery(request)
-        conferences.get() # one result
-        #conferences.fetch () # all results
-        #conferences.fetch (5) # the first five
-         # return individual ConferenceForm object per Conference
-        return ConferenceForms(
-            items=[self._copyConferenceToForm(conf, "") \
-            for conf in conferences]
-        )  
+        conferences = self._getQuery(request)
 
+        # need to fetch organiser displayName from profiles
+        # get all keys and use get_multi for speed
+        organisers = [(ndb.Key(Profile, conf.organizerUserId)) for conf in conferences]
+        profiles = ndb.get_multi(organisers)
+
+        # put display names in a dict for easier fetching
+        names = {}
+        for profile in profiles:
+            names[profile.key.id()] = profile.displayName
+
+        # return individual ConferenceForm object per Conference
+        return ConferenceForms(
+                items=[self._copyConferenceToForm(conf, names[conf.organizerUserId]) for conf in \
+                conferences]
+        )
 
     @endpoints.method(message_types.VoidMessage, ConferenceForms,
         path='getConferencesCreated',
@@ -221,6 +259,39 @@ class ConferenceApi(remote.Service):
         """Register user for selected conference."""
         return self._conferenceRegistration(request)
 
+    @endpoints.method(message_types.VoidMessage, ConferenceForms,
+            path='conferences/attending',
+            http_method='GET', name='getConferencesToAttend')
+    def getConferencesToAttend(self, request):
+        """Get list of conferences that user has registered for."""
+        # TODO:
+        # step 1: get user profile
+        # step 2: get conferenceKeysToAttend from profile.
+        # to make a ndb key from websafe key you can use:
+        # ndb.Key(urlsafe=my_websafe_key_string)
+        # step 3: fetch conferences from datastore. 
+        # Use get_multi(array_of_keys) to fetch all keys at once.
+        # Do not fetch them one by one!
+        prof = self._getProfileFromUser()
+        confs = getattr(prof, "conferenceKeysToAttend")
+        conf_keys = [ndb.Key(urlsafe=mywsks) for mywsks in prof.conferenceKeysToAttend]
+        conferences = ndb.get_multi(conf_keys)
+
+
+        # get organizers
+        organisers = [ndb.Key(Profile, conf.organizerUserId) for conf in conferences]
+        profiles = ndb.get_multi(organisers)
+
+        # put display names in a dict for easier fetching
+        names = {}
+        for profile in profiles:
+            names[profile.key.id()] = profile.displayName
+
+
+        # return set of ConferenceForm objects per Conference
+        return ConferenceForms(items=[self._copyConferenceToForm(conf, names[conf.organizerUserId])\
+         for conf in conferences]
+        )
 # - - - Conference objects - - - - - - - - - - - - - - - - - - -
 
     def _copyConferenceToForm(self, conf, displayName):
@@ -340,10 +411,11 @@ class ConferenceApi(remote.Service):
         return (inequality_field, formatted_filters)
 
 
+
 # TODO
 
 # - - - Registration - - - - - - - - - - - - - - - - - - - -
-
+    @ndb.transactional(xg=True)
     def _conferenceRegistration(self, request, reg=True):
         """Register or unregister user for selected conference."""
         retval = None
@@ -390,6 +462,21 @@ class ConferenceApi(remote.Service):
         prof.put()
         conf.put()
         return BooleanMessage(data=retval)
+
+    @endpoints.method(CONF_GET_REQUEST, BooleanMessage,
+            path='conference/{websafeConferenceKey}',
+            http_method='POST', name='registerForConference')
+    def registerForConference(self, request):
+        """Register user for selected conference."""
+        return self._conferenceRegistration(request)
+
+
+    @endpoints.method(CONF_GET_REQUEST, BooleanMessage,
+            path='conference/{websafeConferenceKey}',
+            http_method='DELETE', name='unregisterFromConference')
+    def unregisterFromConference(self, request):
+        """Unregister user for selected conference."""
+        return self._conferenceRegistration(request, reg=False)
 
 
     
